@@ -19,6 +19,7 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
@@ -75,6 +76,23 @@ static void start_process(void* file_name_) {
   struct intr_frame if_;
   bool success, pcb_success;
 
+  /* Split filename into argc and argv */
+  size_t argc = 0;
+  char** argv;
+  char* token;
+  char* strtok_ptr;
+
+  token = strtok_r(file_name, " ", &strtok_ptr);
+  argv = (char**)malloc((strlen(file_name) + 1) * sizeof(char));
+  if (argv == NULL) {
+    PANIC("Not enough memory");
+  }
+  while (token != NULL) {
+    argv[argc] = token;
+    token = strtok_r(NULL, " ", &strtok_ptr);
+    argc++;
+  }
+
   /* Allocate process control block */
   struct process* new_pcb = malloc(sizeof(struct process));
   success = pcb_success = new_pcb != NULL;
@@ -115,6 +133,9 @@ static void start_process(void* file_name_) {
   if (!success) {
     sema_up(&temporary);
     thread_exit();
+  } else {
+    // Push arguments into stack
+    fill_stack(argv, argc, if_);
   }
 
   /* Start the user process by simulating a return from an
@@ -125,6 +146,44 @@ static void start_process(void* file_name_) {
      and jump to it. */
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
   NOT_REACHED();
+}
+
+/* Push arguments and fake address into the stack */
+void fill_stack(char* argv[], size_t argc, struct intr_frame* if_) {
+  size_t i;
+  size_t arg_size;
+  size_t fake_ra = 0;
+  char* arg_addrs[argc + 1];
+
+  /* Push words to top of stack frame */
+  for (i = argc - 1; i >= 0; i--) {
+    arg_size = strlen(argv[i]) + 1;
+    if_->esp -= arg_size;
+    arg_addrs[i] = (char*)if_->esp;
+    memcpy(&if_->esp, argv[i], arg_size);
+  }
+
+  /* Push NULL pointer sentinel */
+  arg_addrs[argc] = NULL;
+
+  /* Stack alignment */
+  if_->esp -= (size_t)(if_->esp) % 4;
+  /* Push argv char pointers (right to left order) */
+  size_t arg_addrs_size = (argc + 1) * sizeof(char*);
+  if_->esp -= arg_addrs_size;
+  memcpy(if_->esp, arg_addrs, arg_addrs_size);
+
+  /* Push argv */
+  if_->esp -= 4;
+  *((char***)(if_->esp)) = if_->esp + 4;
+
+  /* Push argc */
+  if_->esp -= 4;
+  *((char***)(if_->esp)) = argc;
+
+  /* Push fake return address */
+  if_->esp -= 4;
+  memcpy(if_->esp, &fake_ra, 4);
 }
 
 /* Waits for process with PID child_pid to die and returns its exit status.
@@ -470,9 +529,10 @@ static bool setup_stack(void** esp) {
   kpage = palloc_get_page(PAL_USER | PAL_ZERO);
   if (kpage != NULL) {
     success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
-    if (success)
+    if (success) {
       *esp = PHYS_BASE;
-    else
+      *esp = *esp - 20;
+    } else
       palloc_free_page(kpage);
   }
   return success;
